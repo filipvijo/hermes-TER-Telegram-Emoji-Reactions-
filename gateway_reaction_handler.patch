@@ -1,0 +1,129 @@
+diff --git a/gateway/platforms/telegram.py b/gateway/platforms/telegram.py
+index 23fa8c696..fac643eda 100644
+--- a/gateway/platforms/telegram.py
++++ b/gateway/platforms/telegram.py
+@@ -29,6 +29,7 @@ try:
+         CommandHandler,
+         CallbackQueryHandler,
+         MessageHandler as TelegramMessageHandler,
++        MessageReactionHandler,
+         ContextTypes,
+         filters,
+     )
+@@ -47,6 +48,7 @@ except ImportError:
+     CommandHandler = Any
+     CallbackQueryHandler = Any
+     TelegramMessageHandler = Any
++    MessageReactionHandler = Any
+     HTTPXRequest = Any
+     filters = None
+     ParseMode = None
+@@ -286,6 +288,8 @@ class TelegramAdapter(BasePlatformAdapter):
+         self._model_picker_state: Dict[str, dict] = {}
+         # Approval button state: message_id → session_key
+         self._approval_state: Dict[int, str] = {}
++        # Sent-message cache for reaction auto-responses: (chat_id, message_id) -> text
++        self._sent_message_cache: Dict[tuple, str] = {}
+         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
+         # and any other slash-confirm prompts; see GatewayRunner._request_slash_confirm).
+         self._slash_confirm_state: Dict[str, str] = {}
+@@ -848,6 +852,8 @@ class TelegramAdapter(BasePlatformAdapter):
+             ))
+             # Handle inline keyboard button callbacks (update prompts)
+             self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
++            # Handle emoji reactions on Hermes' messages
++            self._app.add_handler(MessageReactionHandler(self._handle_message_reaction))
+             
+             # Start polling — retry initialize() for transient TLS resets
+             try:
+@@ -1190,6 +1196,11 @@ class TelegramAdapter(BasePlatformAdapter):
+                                 continue
+                         raise
+                 message_ids.append(str(msg.message_id))
++                # Cache sent message for reaction auto-responses
++                try:
++                    self._sent_message_cache[(int(chat_id), msg.message_id)] = chunk
++                except Exception:
++                    pass
+             
+             return SendResult(
+                 success=True,
+@@ -3416,6 +3427,78 @@ class TelegramAdapter(BasePlatformAdapter):
+         )
+ 
+     # ── Message reactions (processing lifecycle) ──────────────────────────
++    async def _handle_message_reaction(
++        self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
++    ) -> None:
++        """Handle emoji reactions on messages sent by Hermes."""
++        if not self._reactions_enabled():
++            return
++
++        reaction = getattr(update, "message_reaction", None)
++        if not reaction:
++            return
++
++        new_reactions = getattr(reaction, "new_reaction", []) or []
++        if not new_reactions:
++            return
++
++        # Extract emoji (ignore custom emoji / paid reactions)
++        emoji = None
++        for r in new_reactions:
++            emoji = getattr(r, "emoji", None)
++            if emoji:
++                break
++        if not emoji:
++            return
++
++        chat_id = getattr(getattr(reaction, "chat", None), "id", None)
++        message_id = getattr(reaction, "message_id", None)
++        if chat_id is None or message_id is None:
++            return
++
++        logger.info("[%s] Reaction %s on msg %s chat %s", self.name, emoji, message_id, chat_id)
++
++        # Look up original message text from cache
++        original_text = self._sent_message_cache.get((int(chat_id), int(message_id)), "")
++        if not original_text:
++            return
++
++        try:
++            import asyncio
++            from tools.telegram_reaction_tool import _generate_response
++
++            # Run sync generation in thread pool to avoid blocking event loop
++            response = await asyncio.to_thread(_generate_response, original_text, emoji)
++            if not response:
++                return
++
++            resp_type = response.get("type")
++            resp_url = response.get("url")
++            resp_text = response.get("text")
++
++            if resp_type == "animation" and resp_url:
++                try:
++                    await self._bot.send_animation(
++                        chat_id=int(chat_id),
++                        animation=resp_url,
++                        reply_to_message_id=int(message_id),
++                        caption=resp_text or "",
++                    )
++                except Exception:
++                    if resp_text:
++                        await self._bot.send_message(
++                            chat_id=int(chat_id),
++                            text=resp_text,
++                            reply_to_message_id=int(message_id),
++                        )
++            elif resp_text:
++                await self._bot.send_message(
++                    chat_id=int(chat_id),
++                    text=resp_text,
++                    reply_to_message_id=int(message_id),
++                )
++        except Exception as exc:
++            logger.debug("[%s] Reaction response failed: %s", self.name, exc)
+ 
+     def _reactions_enabled(self) -> bool:
+         """Check if message reactions are enabled via config/env."""
